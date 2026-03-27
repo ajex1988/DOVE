@@ -4,7 +4,6 @@ import logging
 
 import torch
 from torchvision import transforms
-from torchvision.io import write_video
 from tqdm import tqdm
 
 from diffusers import (
@@ -22,8 +21,8 @@ import os
 import cv2
 from PIL import Image
 
-from pathlib import Path
 import pyiqa
+import imageio
 import imageio.v3 as iio
 import glob
 
@@ -189,6 +188,224 @@ def save_video_with_imageio(video, output_path, fps=8, format='yuv444p'):
         )
 
 
+def compute_video_padding(num_frames, height, width, frame_multiple=8, spatial_multiple=16):
+    pad_f = 0
+    if num_frames > 0:
+        remainder = (num_frames - 1) % frame_multiple
+        if remainder != 0:
+            pad_f = frame_multiple - remainder
+
+    pad_h = (spatial_multiple - height % spatial_multiple) % spatial_multiple
+    pad_w = (spatial_multiple - width % spatial_multiple) % spatial_multiple
+    return pad_f, pad_h, pad_w
+
+
+def interpolate_video_frames(frames, size, mode):
+    interpolate_kwargs = {"size": size, "mode": mode}
+    if mode in {"linear", "bilinear", "bicubic", "trilinear"}:
+        interpolate_kwargs["align_corners"] = False
+    return torch.nn.functional.interpolate(frames, **interpolate_kwargs)
+
+
+def load_video_chunk(
+    video_reader,
+    start_idx,
+    end_idx,
+    pad_h,
+    pad_w,
+    upscale,
+    upscale_mode,
+):
+    num_frames = len(video_reader)
+    read_end = min(end_idx, num_frames)
+    frame_indices = list(range(start_idx, read_end))
+
+    if frame_indices:
+        frames = video_reader.get_batch(frame_indices)
+        last_frame = frames[-1:]
+    else:
+        last_frame = video_reader[num_frames - 1].unsqueeze(0)
+        frames = last_frame.new_empty((0, *last_frame.shape[1:]))
+
+    if end_idx > read_end:
+        repeated_frames = last_frame.repeat(end_idx - read_end, 1, 1, 1)
+        frames = torch.cat([frames, repeated_frames], dim=0)
+
+    if pad_h > 0 or pad_w > 0:
+        frames = torch.nn.functional.pad(frames, pad=(0, 0, 0, pad_w, 0, pad_h))
+
+    frames = frames.float().permute(0, 3, 1, 2).contiguous()
+    target_height = frames.shape[2] * upscale
+    target_width = frames.shape[3] * upscale
+    frames = interpolate_video_frames(frames, size=(target_height, target_width), mode=upscale_mode)
+    frames = frames / 255.0 * 2.0 - 1.0
+    return frames.unsqueeze(0).permute(0, 2, 1, 3, 4).contiguous()
+
+
+def get_valid_temporal_region(t_start, t_end, total_frames, overlap_t):
+    t_len = t_end - t_start
+    valid_t_start = 0 if t_start == 0 else overlap_t // 2
+    valid_t_end = t_len if t_end == total_frames else t_len - overlap_t // 2
+
+    return {
+        "valid_t_start": valid_t_start,
+        "valid_t_end": valid_t_end,
+        "out_t_start": t_start + valid_t_start,
+        "out_t_end": t_start + valid_t_end,
+    }
+
+
+def resolve_gt_sequence_path(gt_dir, file_name):
+    direct_path = os.path.join(gt_dir, file_name)
+    if os.path.exists(direct_path):
+        return direct_path
+
+    stem = Path(file_name).stem
+    stem_path = os.path.join(gt_dir, stem)
+    if os.path.exists(stem_path):
+        return stem_path
+
+    for ext in video_exts + [".png", ".jpg", ".jpeg"]:
+        candidate = os.path.join(gt_dir, f"{stem}{ext}")
+        if os.path.exists(candidate):
+            return candidate
+
+    raise FileNotFoundError(f"Ground-truth sequence not found for {file_name} in {gt_dir}")
+
+
+def get_model_device(model):
+    if hasattr(model, "device"):
+        return model.device
+
+    try:
+        return next(model.parameters()).device
+    except (StopIteration, AttributeError):
+        return torch.device("cpu")
+
+
+class StreamingSequenceWriter:
+    def __init__(self, output_path, fps=8, png_save=False, save_format="yuv444p"):
+        self.png_save = png_save
+        self.frame_idx = 0
+        self.writer = None
+
+        if self.png_save:
+            self.output_dir = output_path.rsplit('.', 1)[0]
+            os.makedirs(self.output_dir, exist_ok=True)
+            return
+
+        self.output_path = output_path.replace(".mkv", ".mp4")
+        writer_kwargs = {
+            "fps": fps,
+            "codec": "libx264",
+            "macro_block_size": None,
+        }
+        if save_format == "yuv444p":
+            writer_kwargs["pixelformat"] = "yuv444p"
+            writer_kwargs["ffmpeg_params"] = ["-crf", "0"]
+        else:
+            writer_kwargs["pixelformat"] = "yuv420p"
+            writer_kwargs["ffmpeg_params"] = ["-crf", "10"]
+
+        self.writer = imageio.get_writer(self.output_path, **writer_kwargs)
+
+    def append(self, frames):
+        # frames: [F, C, H, W] in [0, 1]
+        frames_uint8 = (frames.permute(0, 2, 3, 1) * 255).clamp(0, 255).to(torch.uint8).cpu().numpy()
+
+        if self.png_save:
+            for frame in frames_uint8:
+                file_path = os.path.join(self.output_dir, f"{self.frame_idx:03d}.png")
+                Image.fromarray(frame).save(file_path)
+                self.frame_idx += 1
+            return
+
+        for frame in frames_uint8:
+            self.writer.append_data(frame)
+            self.frame_idx += 1
+
+    def close(self):
+        if self.writer is not None:
+            self.writer.close()
+            self.writer = None
+
+
+class SequenceFrameReader:
+    def __init__(self, path):
+        self.path = path
+        self.mode = None
+        self.length = 0
+        self.image_files = None
+        self.video_reader = None
+
+        if os.path.isdir(path):
+            self.mode = "folder"
+            self.image_files = sorted([
+                os.path.join(path, f) for f in os.listdir(path)
+                if f.lower().endswith((".png", ".jpg", ".jpeg"))
+            ])
+            self.length = len(self.image_files)
+        elif os.path.isfile(path):
+            if is_video_file(path):
+                self.mode = "video"
+                self.video_reader = decord.VideoReader(uri=Path(path).as_posix())
+                self.length = len(self.video_reader)
+            elif path.lower().endswith((".png", ".jpg", ".jpeg")):
+                self.mode = "image"
+                self.length = 1
+            else:
+                raise ValueError(f"Unsupported ground-truth input: {path}")
+        else:
+            raise FileNotFoundError(f"Ground-truth input does not exist: {path}")
+
+        if self.length == 0:
+            raise ValueError(f"No frames found in ground-truth input: {path}")
+
+    def read_batch(self, start_idx, end_idx):
+        if end_idx <= start_idx:
+            return None
+
+        if self.mode == "video":
+            frames = self.video_reader.get_batch(list(range(start_idx, min(end_idx, self.length))))
+            return frames.float().permute(0, 3, 1, 2).contiguous() / 255.0
+
+        if self.mode == "folder":
+            frames = [
+                to_tensor(Image.open(self.image_files[i]).convert("RGB"))
+                for i in range(start_idx, min(end_idx, self.length))
+            ]
+            return torch.stack(frames) if frames else None
+
+        if self.mode == "image":
+            if start_idx > 0:
+                return None
+            return to_tensor(Image.open(self.path).convert("RGB")).unsqueeze(0)
+
+        raise ValueError(f"Unsupported reader mode: {self.mode}")
+
+
+@no_grad
+def accumulate_chunk_metrics(pred_frames, gt_frames, metrics_model, metric_sums, metric_counts):
+    if gt_frames is None:
+        raise ValueError("Ground-truth frames are required when metrics are enabled.")
+
+    num_frames = min(pred_frames.shape[0], gt_frames.shape[0])
+    pred_frames = pred_frames[:num_frames]
+    gt_frames = gt_frames[:num_frames]
+
+    for name, model in metrics_model.items():
+        metric_device = get_model_device(model)
+        for i in range(num_frames):
+            pred = pred_frames[i].unsqueeze(0).to(metric_device)
+            if name in fr_metrics:
+                gt = gt_frames[i].unsqueeze(0).to(metric_device)
+                score = model(pred, gt).item()
+            else:
+                score = model(pred).item()
+            metric_sums[name] += score
+            metric_counts[name] += 1
+
+
 def preprocess_video_match(
     video_path: Path | str,
     is_match: bool = False,
@@ -255,7 +472,7 @@ def make_temporal_chunks(F, chunk_len, overlap_t=8):
     Returns:
         time_chunks: List of (start_t, end_t) tuples
     """
-    if chunk_len == 0:
+    if chunk_len == 0 or chunk_len >= F or F <= overlap_t:
         return [(0, F)]
 
     effective_stride = chunk_len - overlap_t
@@ -263,6 +480,8 @@ def make_temporal_chunks(F, chunk_len, overlap_t=8):
         raise ValueError("chunk_len must be greater than overlap")
 
     chunk_starts = list(range(0, F - overlap_t, effective_stride))
+    if not chunk_starts:
+        chunk_starts = [0]
     if chunk_starts[-1] + chunk_len < F:
         chunk_starts.append(F - chunk_len)
 
@@ -567,6 +786,8 @@ if __name__ == "__main__":
         overlap_t = args.overlap_t
     else:
         overlap_t = 0
+    args.tile_size_hw = tuple(args.tile_size_hw)
+
     if args.tile_size_hw != (0, 0):
         print(f"Tiling video into {args.tile_size_hw} frames with {args.overlap_hw} overlap")
         overlap_hw = args.overlap_hw
@@ -656,7 +877,13 @@ if __name__ == "__main__":
                 metrics_models[name] = pyiqa.create_metric(name).to(pipe.device).eval()
             except Exception as e:
                 print(f"Failed to initialize metric '{name}': {e}")
-        metric_accumulator = {name: [] for name in metrics_list}
+        metrics_list = list(metrics_models.keys())
+        if metrics_list:
+            metric_accumulator = {name: [] for name in metrics_list}
+        else:
+            print("Warning: No metrics were initialized successfully. Metrics evaluation will be skipped.")
+            metrics_models = None
+            metric_accumulator = None
     else:
         metrics_models = None
         metric_accumulator = None
@@ -665,90 +892,149 @@ if __name__ == "__main__":
         video_name = os.path.basename(video_path)
         prompt = video_prompt_dict.get(video_name, "")
         if os.path.exists(video_path):
-            # Read video
-            # [F, C, H, W]
-            video, pad_f, pad_h, pad_w, original_shape = preprocess_video_match(video_path, is_match=True)
-            H_, W_ = video.shape[2], video.shape[3]
-            video = torch.nn.functional.interpolate(video, size=(H_*args.upscale, W_*args.upscale), mode=args.upscale_mode, align_corners=False)
-            __frame_transform = transforms.Compose(
-                [transforms.Lambda(lambda x: x / 255.0 * 2.0 - 1.0)] # -1, 1
-            )
-            video = torch.stack([__frame_transform(f) for f in video], dim=0)
-            video = video.unsqueeze(0)
-            # [B, C, F, H, W]
-            video = video.permute(0, 2, 1, 3, 4).contiguous()
-
-            _B, _C, _F, _H, _W = video.shape
-            time_chunks = make_temporal_chunks(_F, args.chunk_len, overlap_t)
-            spatial_tiles = make_spatial_tiles(_H, _W, args.tile_size_hw, overlap_hw)
-
-            output_video = torch.zeros_like(video)
-            write_count = torch.zeros_like(video, dtype=torch.int)
-
-            print(f"Process video: {video_name} | Prompt: {prompt} | Frame: {_F} (ori: {original_shape[0]}; pad: {pad_f}) | Target Resolution: {_H}, {_W} (ori: {original_shape[1]*args.upscale}, {original_shape[2]*args.upscale}; pad: {pad_h}, {pad_w}) | Chunk Num: {len(time_chunks)*len(spatial_tiles)}")
-
-            for t_start, t_end in time_chunks:
-                for h_start, h_end, w_start, w_end in spatial_tiles:
-                    video_chunk = video[:, :, t_start:t_end, h_start:h_end, w_start:w_end]
-                    # print(f"video_chunk: {video_chunk.shape} | t: {t_start}:{t_end} | h: {h_start}:{h_end} | w: {w_start}:{w_end}")
-
-                    # [B, C, F, H, W]
-                    _video_generate = process_video(
-                        pipe=pipe,
-                        video=video_chunk,
-                        prompt=prompt,
-                        noise_step=args.noise_step,
-                        sr_noise_step=args.sr_noise_step,
-                        empty_prompt_embedding=empty_prompt_embedding,
-                    )
-
-                    region = get_valid_tile_region(
-                        t_start, t_end, h_start, h_end, w_start, w_end,
-                        video_shape=video.shape,
-                        overlap_t=overlap_t,
-                        overlap_h=overlap_hw[0],
-                        overlap_w=overlap_hw[1],
-                    )
-                    output_video[:, :, region["out_t_start"]:region["out_t_end"],
-                                    region["out_h_start"]:region["out_h_end"],
-                                    region["out_w_start"]:region["out_w_end"]] = \
-                    _video_generate[:, :, region["valid_t_start"]:region["valid_t_end"],
-                                    region["valid_h_start"]:region["valid_h_end"],
-                                    region["valid_w_start"]:region["valid_w_end"]]
-                    write_count[:, :, region["out_t_start"]:region["out_t_end"],
-                                    region["out_h_start"]:region["out_h_end"],
-                                    region["out_w_start"]:region["out_w_end"]] += 1
-            
-            video_generate = output_video
-
-            if (write_count == 0).any():
-                print("Error: Lack of write in region !!!")
-                exit()
-            if (write_count > 1).any():
-                print("Error: Write count > 1 in region !!!")
-                exit()
-
-            video_generate = remove_padding_and_extra_frames(video_generate, pad_f, pad_h*4, pad_w*4)
             file_name = os.path.basename(video_path)
             output_path = os.path.join(args.output_path, file_name)
+            video_reader = decord.VideoReader(uri=Path(video_path).as_posix())
+            original_num_frames = len(video_reader)
+            original_height, original_width = video_reader[0].shape[:2]
+
+            pad_f, pad_h, pad_w = compute_video_padding(original_num_frames, original_height, original_width)
+            total_num_frames = original_num_frames + pad_f
+            padded_height = original_height + pad_h
+            padded_width = original_width + pad_w
+            target_height = padded_height * args.upscale
+            target_width = padded_width * args.upscale
+            output_height = original_height * args.upscale
+            output_width = original_width * args.upscale
+
+            time_chunks = make_temporal_chunks(total_num_frames, args.chunk_len, overlap_t)
+            spatial_tiles = make_spatial_tiles(target_height, target_width, args.tile_size_hw, overlap_hw)
+
+            gt_reader = None
+            if metrics_models is not None:
+                if args.gt_dir is None:
+                    raise ValueError("--gt_dir is required when --eval_metrics is enabled.")
+                gt_reader = SequenceFrameReader(resolve_gt_sequence_path(args.gt_dir, file_name))
+                video_metric_sums = {name: 0.0 for name in metrics_models}
+                video_metric_counts = {name: 0 for name in metrics_models}
+
+            writer = StreamingSequenceWriter(
+                output_path=output_path,
+                fps=args.fps,
+                png_save=args.png_save,
+                save_format=args.save_format,
+            )
+
+            print(
+                f"Process video: {video_name} | Prompt: {prompt} | Frame: {total_num_frames} "
+                f"(ori: {original_num_frames}; pad: {pad_f}) | Target Resolution: {target_height}, {target_width} "
+                f"(ori: {output_height}, {output_width}; pad: {pad_h}, {pad_w}) | Chunk Num: {len(time_chunks) * len(spatial_tiles)}"
+            )
+
+            try:
+                for chunk_idx, (t_start, t_end) in enumerate(time_chunks, start=1):
+                    print(f"  Temporal chunk {chunk_idx}/{len(time_chunks)}: {t_start}:{t_end}")
+                    video_chunk = load_video_chunk(
+                        video_reader=video_reader,
+                        start_idx=t_start,
+                        end_idx=t_end,
+                        pad_h=pad_h,
+                        pad_w=pad_w,
+                        upscale=args.upscale,
+                        upscale_mode=args.upscale_mode,
+                    )
+                    chunk_frames = t_end - t_start
+
+                    chunk_output = torch.zeros(
+                        (1, 3, chunk_frames, target_height, target_width),
+                        dtype=torch.float16,
+                    )
+                    write_count = torch.zeros(
+                        (1, 1, chunk_frames, target_height, target_width),
+                        dtype=torch.uint8,
+                    )
+
+                    for h_start, h_end, w_start, w_end in spatial_tiles:
+                        tile_chunk = video_chunk[:, :, :, h_start:h_end, w_start:w_end]
+                        tile_output = process_video(
+                            pipe=pipe,
+                            video=tile_chunk,
+                            prompt=prompt,
+                            noise_step=args.noise_step,
+                            sr_noise_step=args.sr_noise_step,
+                            empty_prompt_embedding=empty_prompt_embedding,
+                        )
+
+                        region = get_valid_tile_region(
+                            0,
+                            chunk_frames,
+                            h_start,
+                            h_end,
+                            w_start,
+                            w_end,
+                            video_shape=chunk_output.shape,
+                            overlap_t=0,
+                            overlap_h=overlap_hw[0],
+                            overlap_w=overlap_hw[1],
+                        )
+                        chunk_output[:, :, :, region["out_h_start"]:region["out_h_end"], region["out_w_start"]:region["out_w_end"]] = (
+                            tile_output[:, :, :, region["valid_h_start"]:region["valid_h_end"], region["valid_w_start"]:region["valid_w_end"]]
+                            .to(chunk_output.dtype)
+                            .cpu()
+                        )
+                        write_count[:, :, :, region["out_h_start"]:region["out_h_end"], region["out_w_start"]:region["out_w_end"]] += 1
+                        del tile_chunk
+                        del tile_output
+
+                    if (write_count == 0).any():
+                        raise RuntimeError("Found unwritten pixels in chunk reconstruction.")
+                    if (write_count > 1).any():
+                        raise RuntimeError("Found multiply written pixels in chunk reconstruction.")
+
+                    temporal_region = get_valid_temporal_region(t_start, t_end, total_num_frames, overlap_t)
+                    out_t_start = temporal_region["out_t_start"]
+                    out_t_end = min(temporal_region["out_t_end"], original_num_frames)
+                    num_valid_frames = out_t_end - out_t_start
+
+                    if num_valid_frames > 0:
+                        valid_chunk = chunk_output[
+                            :,
+                            :,
+                            temporal_region["valid_t_start"]:temporal_region["valid_t_start"] + num_valid_frames,
+                            :output_height,
+                            :output_width,
+                        ]
+                        pred_frames = valid_chunk[0].permute(1, 0, 2, 3).contiguous().float()
+
+                        if metrics_models is not None:
+                            gt_frames = gt_reader.read_batch(out_t_start, out_t_end)
+                            accumulate_chunk_metrics(
+                                pred_frames=pred_frames,
+                                gt_frames=gt_frames,
+                                metrics_model=metrics_models,
+                                metric_sums=video_metric_sums,
+                                metric_counts=video_metric_counts,
+                            )
+
+                        writer.append(pred_frames)
+
+                    del video_chunk
+                    del chunk_output
+                    del write_count
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+            finally:
+                writer.close()
 
             if metrics_models is not None:
-                #  [1, C, F, H, W] -> [F, C, H, W]
-                pred_frames = video_generate[0]
-                pred_frames = pred_frames.permute(1, 0, 2, 3).contiguous()
-                if args.gt_dir is not None:
-                    gt_frames = load_sequence(os.path.join(args.gt_dir, file_name))
-                else:
-                    gt_frames = None
-                compute_metrics(pred_frames, gt_frames, metrics_models, metric_accumulator, file_name)
-
-            if args.png_save:
-                # Save as PNG sequence
-                output_dir = output_path.rsplit('.', 1)[0]  # Remove extension
-                save_frames_as_png(video_generate, output_dir, fps=args.fps)
-            else:
-                output_path = output_path.replace('.mkv', '.mp4')
-                save_video_with_imageio(video_generate, output_path, fps=args.fps, format=args.save_format)
+                print(f"\n\n[{file_name}] Metrics:", end=" ")
+                for name in metrics_models:
+                    if video_metric_counts[name] == 0:
+                        raise RuntimeError(f"No frames were evaluated for metric {name} in {file_name}.")
+                    val = video_metric_sums[name] / video_metric_counts[name]
+                    metric_accumulator[name].append(val)
+                    print(f"{name.upper()}={val:.4f}", end="  ")
+                print()
         else:
             print(f"Warning: {video_name} not found in {args.input_dir}")
 
